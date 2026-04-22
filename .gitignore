@@ -1,0 +1,84 @@
+# =============================================================
+# FeaturePuzzles .gitignore
+# Keep only source code + markdown.
+# Exclude checkpoints, outputs, image data, and 3rd-party clones.
+# =============================================================
+
+# ---- Python build / cache ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Notebook checkpoints / autosaves ----
+.ipynb_checkpoints/
+*.ipynb~
+
+# ---- Editor / IDE ----
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+
+# ---- Environment / OS ----
+.env
+.venv/
+venv/
+env/
+.DS_Store
+Thumbs.db
+
+# =============================================================
+# Heavy data we never want in git (per project policy)
+# =============================================================
+
+# Top-level model checkpoints / training artifacts
+checkpoints/
+output/
+outputs/
+runs/
+wandb/
+logs/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+*.npz
+
+# Third-party repos cloned into the workspace
+repo/
+puzzles/
+TrainingFreeVGGTMatching/FastVGGT/
+
+# Demo example assets (large)
+TrainingFreeVGGTMatching/examples/
+
+# Pretrained weights pulled by the prompt_matching pipeline
+TrainingFreeVGGTMatching/prompt_matching/weights/
+
+# All generated puzzle data + per-run outputs (image data, training records)
+TrainingFreeVGGTMatching/compare_prompt_token_data/
+TrainingFreeVGGTMatching/compare_prompt_token_outputs/
+TrainingFreeVGGTMatching/infer_prompt_matching_data/
+TrainingFreeVGGTMatching/infer_prompt_matching_outputs/
+TrainingFreeVGGTMatching/prompt_matching_data/
+TrainingFreeVGGTMatching/prompt_matching_outputs/
+TrainingFreeVGGTMatching/prompt_matching_outputs_*/
+
+# Catch-all for any future *_data / *_outputs directories
+**/prompt_matching_data/
+**/prompt_matching_outputs*/
+**/compare_prompt_token_data/
+**/compare_prompt_token_outputs/
+**/infer_prompt_matching_data/
+**/infer_prompt_matching_outputs/

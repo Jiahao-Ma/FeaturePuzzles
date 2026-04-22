@@ -1,0 +1,35 @@
+# Reproducible deps for the `puzzles` conda environment.
+#
+# Tested on python 3.11.15, CUDA 12.4, sm_80 GPU.
+# Install order (torch first, on its own index):
+#
+#   conda create -n puzzles python=3.11 -y
+#   conda activate puzzles
+#   pip install --index-url https://download.pytorch.org/whl/cu124 \
+#       torch==2.5.1 torchvision==0.20.1
+#   pip install --index-url https://pypi.org/simple/ -r requirements.txt
+#
+# `numpy<2` is pinned because parts of the FastVGGT tree still use the
+# numpy-1.x C ABI (e.g. `from numpy import block` in
+# `vggt/models/aggregator.py`).
+
+numpy==1.26.4
+opencv-python-headless==4.11.0.86
+# opencv-python==4.11.0.86 is installed alongside (pulled in by ultralytics);
+# we force it to the <4.12 line so numpy 1.26 keeps satisfying it. If you only
+# need prompt_matching/run.py you can drop opencv-python entirely.
+opencv-python==4.11.0.86
+Pillow==12.1.1
+einops==0.8.2
+scipy==1.17.1
+matplotlib==3.10.8
+tqdm==4.67.3
+scikit-image==0.26.0
+huggingface_hub==1.11.0
+safetensors==0.7.0
+
+# Auto mask generation (prompt_matching/generate_masks.py,
+# prompt_matching/run_scene_batch.py).
+# ultralytics ships both YOLOv8-seg and FastSAM. Weights (yolov8x-seg.pt,
+# FastSAM-x.pt) are downloaded on first use — see prompt_matching/weights/.
+ultralytics==8.4.40

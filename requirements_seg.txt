@@ -1,0 +1,11 @@
+torch>=2.3.0
+torchvision>=0.18.0
+timm
+scipy
+einops
+opencv-python
+safetensors
+huggingface-hub[torch]
+matplotlib
+numpy>=1.26.4
+pillow
