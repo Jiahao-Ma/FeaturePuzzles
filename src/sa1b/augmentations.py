@@ -102,15 +102,14 @@ class CropAugmentor:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         H, W = image.shape[:2]
 
+        # Horizontal flip: valid for natural images (left-right symmetry OK)
         if rng.random() < 0.5:
             image = np.fliplr(image).copy()
             gt_masks = np.flip(gt_masks, axis=-1).copy()
             prompt_mask = np.flip(prompt_mask, axis=-1).copy()
 
-        if rng.random() < 0.2:
-            image = np.flipud(image).copy()
-            gt_masks = np.flip(gt_masks, axis=-2).copy()
-            prompt_mask = np.flip(prompt_mask, axis=-2).copy()
+        # DISABLED: vertical flip — breaks gravity/sky-ground prior;
+        # VGGT patch embeddings rely on natural scene orientation.
 
         if rng.random() < 0.4:
             angle = float(rng.uniform(-15, 15))
@@ -119,31 +118,25 @@ class CropAugmentor:
             gt_masks = self._warp_masks(gt_masks, M, W, H)
             prompt_mask = self._warp_masks(prompt_mask, M, W, H)
 
+        # Affine: scale + translation only — shear removed because it creates
+        # non-physical skew that doesn't occur in real multi-view captures and
+        # distorts the spatial patch structure VGGT relies on.
         if rng.random() < 0.3:
             tx = float(rng.uniform(-0.1, 0.1)) * W
             ty = float(rng.uniform(-0.1, 0.1)) * H
             sx = float(rng.uniform(0.8, 1.2))
             sy = float(rng.uniform(0.8, 1.2))
-            shear_x = float(rng.uniform(-0.17, 0.17))
-            cos_a, sin_a = 1.0, 0.0
             M = np.float32([
-                [sx * cos_a + shear_x * sin_a,
-                 sx * (-sin_a) + shear_x * cos_a, tx],
-                [sy * sin_a, sy * cos_a, ty],
+                [sx, 0.0, tx],
+                [0.0, sy, ty],
             ])
             image = cv2.warpAffine(image, M, (W, H), borderValue=0)
             gt_masks = self._warp_masks(gt_masks, M, W, H)
             prompt_mask = self._warp_masks(prompt_mask, M, W, H)
 
-        if rng.random() < 0.3:
-            d = float(rng.uniform(0.0, 0.2))
-            pts_src = np.float32([[0, 0], [W, 0], [W, H], [0, H]])
-            pts_dst = pts_src + rng.uniform(-d * min(W, H), d * min(W, H),
-                                            size=(4, 2)).astype(np.float32)
-            M_persp = cv2.getPerspectiveTransform(pts_src, pts_dst)
-            image = cv2.warpPerspective(image, M_persp, (W, H), borderValue=0)
-            gt_masks = self._warp_masks_perspective(gt_masks, M_persp, W, H)
-            prompt_mask = self._warp_masks_perspective(prompt_mask, M_persp, W, H)
+        # DISABLED: perspective warp — puzzle crops already simulate viewpoint
+        # variation; applying perspective a second time double-distorts patches
+        # beyond VGGT's training distribution.
 
         if rng.random() < 0.4:
             scale = float(rng.uniform(0.75, 1.0))

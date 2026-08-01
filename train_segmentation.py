@@ -42,7 +42,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "repo" / "Pi3"))
 
 from sa1b.sa1b_puzzles_dataset import SA1BPuzzlesDataset  # noqa: E402
-from models.pi3x_segmentation import build_pi3x_segmentation  # noqa: E402
+from models.vggt_segmentation import build_vggt_segmentation  # noqa: E402
 from utils.loss_utils import segmentation_loss  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -78,11 +78,13 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--sa1b_root", type=str, default="/mnt/dataset/marko/data/sa1b/data")
     p.add_argument("--shard_names", type=str, nargs="*", default=None)
     p.add_argument("--checkpoint", type=str, default=None,
-                   help="Path to Pi3X .safetensors checkpoint (None = HF download)")
+                   help="VGGT .pt (HF hub fallback) or Pi3X .safetensors")
+    p.add_argument("--resume", type=str, default=None,
+                   help="Path to checkpoint-last.pth to resume training from")
     p.add_argument("--output_dir", type=str, default="output/seg")
 
     p.add_argument("--n_views", type=int, default=6)
-    p.add_argument("--resolution", type=int, default=224)
+    p.add_argument("--resolution", type=int, default=518)
     p.add_argument("--max_instances", type=int, default=16)
     p.add_argument("--max_prompts", type=int, default=4)
 
@@ -100,19 +102,100 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--num_decoder_layers", type=int, default=3)
     p.add_argument("--nhead", type=int, default=8)
 
+    p.add_argument("--backbone", choices=["vggt", "vggt_omega", "pi3x"], default="vggt")
+    p.add_argument("--work_dim", type=int, default=512)
+    p.add_argument("--n_obj_tokens", type=int, default=4)
+    p.add_argument("--n_twoway_layers", type=int, default=2)
+    p.add_argument("--vggt_layers", type=int, nargs="+", default=None,
+                   help="VGGT/VGGT-Omega blocks whose patch tokens are consumed "
+                        "(subset of {4,11,17,23}). Defaults: vggt -> (17, 23), "
+                        "vggt_omega -> (4, 11, 17, 23).")
+    p.add_argument("--lora_rank", type=int, default=16,
+                   help="LoRA rank for vggt_omega LearnableLayerFusion adapters.")
+    p.add_argument("--lora_alpha", type=float, default=1.0,
+                   help="LoRA scaling alpha for vggt_omega LearnableLayerFusion.")
+    p.add_argument("--use_cross_view", action="store_true", default=True,
+                   help="Enable CrossViewAttention layer (vggt_omega only).")
+    p.add_argument("--no_cross_view", dest="use_cross_view", action="store_false",
+                   help="Disable CrossViewAttention layer.")
+    p.add_argument("--pixel_out_dim", type=int, default=None,
+                   help="PixelDecoder output channels. Defaults: vggt -> 64, vggt_omega -> 96.")
+
+    p.add_argument("--lambda_iou", type=float, default=1.0)
+    p.add_argument("--lambda_occ", type=float, default=0.2)
+    p.add_argument("--lambda_consist", type=float, default=0.01,
+                   help="Cross-view mask_tok consistency (Question 2 regularizer)")
+    p.add_argument("--lambda_point", type=float, default=1.0,
+                   help="Point supervision: prob high at +pts, low at -pts (vggt_omega).")
+    p.add_argument("--prompt_modalities", nargs="+", default=["mask", "box", "point"],
+                   choices=["mask", "box", "point"],
+                   help="Prompt modalities to sample during training.")
+    p.add_argument("--max_prompt_points", type=int, default=6,
+                   help="Max points (pos+neg) per point-prompt instance.")
+    p.add_argument("--multiview_prompt_prob", type=float, default=0.5,
+                   help="Probability of placing prompts on >1 view per instance.")
+    p.add_argument("--use_geom_pe", action="store_true", default=True,
+                   help="Enable 3D positional encoding from depth+pose (vggt_omega).")
+    p.add_argument("--no_geom_pe", dest="use_geom_pe", action="store_false",
+                   help="Disable 3D positional encoding.")
+
     p.add_argument("--curriculum", action="store_true",
                    help="Enable curriculum overlap scheduling")
     p.add_argument("--no_augment", action="store_true",
                    help="Disable data augmentation on train set")
+    # Optional dataset overrides (for ablations / verification smokes).
+    p.add_argument("--min_box_scale", type=float, default=None,
+                   help="Override SA1BPuzzlesDataset.min_box_size_scale")
+    p.add_argument("--max_box_scale", type=float, default=None,
+                   help="Override SA1BPuzzlesDataset.max_box_size_scale")
+    p.add_argument("--min_overlap", type=float, default=None,
+                   help="Override SA1BPuzzlesDataset.min_overlap")
+    p.add_argument("--max_overlap", type=float, default=None,
+                   help="Override SA1BPuzzlesDataset.max_overlap")
 
     p.add_argument("--val_split", type=float, default=0.05)
     p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--prefetch_factor", type=int, default=2,
+                   help="DataLoader prefetch_factor (set None to disable)")
     p.add_argument("--save_freq", type=int, default=1)
     p.add_argument("--print_freq", type=int, default=20)
     p.add_argument("--vis_freq", type=int, default=100,
                    help="Log visual samples to TensorBoard every N training steps")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda")
+
+    # -- Backbone LoRA fine-tuning (Stage 1) --
+    p.add_argument("--init_from", type=str, default=None,
+                   help="Path to a checkpoint whose head_state_dict (and optional "
+                        "backbone_lora_state_dict) is loaded as initialization. "
+                        "Unlike --resume, optimizer/epoch start fresh.")
+    p.add_argument("--init_skip_backbone_lora", action="store_true",
+                   help="With --init_from: do NOT load the old backbone LoRA weights "
+                        "(use when the LoRA layout changed, e.g. start_layer 0 -> 18, "
+                        "so the new LoRA tail trains from scratch).")
+    p.add_argument("--backbone_lora", action="store_true",
+                   help="Inject trainable LoRA adapters into the frozen VGGT-Omega "
+                        "aggregator (vggt_omega only).")
+    p.add_argument("--backbone_lora_rank", type=int, default=16,
+                   help="Base LoRA rank (mid layers x2, late layers x4, "
+                        "inter-frame blocks x2 on top).")
+    p.add_argument("--backbone_lora_alpha", type=float, default=16.0,
+                   help="Base LoRA alpha (scaled with rank so alpha/rank stays "
+                        "constant across tiers).")
+    p.add_argument("--backbone_lora_start_layer", type=int, default=18,
+                   help="Only inject LoRA into aggregator blocks with index >= this. "
+                        "Default 18 keeps blocks 0-17 shared and lets the clean tail "
+                        "(LoRA off) serve the depth/camera recon heads while the LoRA "
+                        "tail serves segmentation.")
+
+    p.add_argument("--compile_backbone", action="store_true",
+                   help="torch.compile the frozen backbone to speed up forward pass")
+    p.add_argument("--compile_mode", type=str, default="default",
+                   choices=["default", "reduce-overhead", "max-autotune"],
+                   help="torch.compile mode for backbone")
+    p.add_argument("--ddp_find_unused", action="store_true",
+                   help="Enable DDP find_unused_parameters (slower; only needed if "
+                        "some trainable params don't receive gradients)")
 
     return p.parse_args()
 
@@ -280,30 +363,59 @@ def _pad_collate(batch):
     # but M may differ across samples in a batch — pad to max.
     max_m = max(b["prompt_masks"].shape[1] for b in batch)
     max_pv = max(b["prompt_views"].shape[0] for b in batch)
+    has_multimodal = "prompt_points" in batch[0]
+    max_p = max((b["prompt_points"].shape[2] for b in batch), default=0) if has_multimodal else 0
 
     imgs = torch.stack([b["imgs"] for b in batch])
 
     prompt_list, gt_list, pv_list = [], [], []
+    pts_list, lab_list, box_list, boxv_list = [], [], [], []
     for b in batch:
         pm = b["prompt_masks"]
         g = b["gt_consistent_masks"]
         pv = b["prompt_views"]
         N, M, H, W = pm.shape
-        if M < max_m:
-            pm = torch.cat([pm, torch.zeros(N, max_m - M, H, W)], dim=1)
-            g = torch.cat([g, torch.zeros(N, max_m - M, H, W)], dim=1)
+        pad_m = max_m - M
+        if pad_m > 0:
+            pm = torch.cat([pm, torch.zeros(N, pad_m, H, W)], dim=1)
+            g = torch.cat([g, torch.zeros(N, pad_m, H, W)], dim=1)
         if pv.shape[0] < max_pv:
             pv = torch.cat([pv, torch.zeros(max_pv - pv.shape[0], dtype=torch.long)])
         prompt_list.append(pm)
         gt_list.append(g)
         pv_list.append(pv)
 
-    return {
+        if has_multimodal:
+            pts = b["prompt_points"]            # (N, M, P, 2)
+            lab = b["prompt_point_labels"]      # (N, M, P)
+            box = b["prompt_boxes"]             # (N, M, 4)
+            boxv = b["prompt_box_valid"]        # (N, M)
+            P = pts.shape[2]
+            if P < max_p:
+                pts = torch.cat([pts, torch.zeros(N, M, max_p - P, 2)], dim=2)
+                lab = torch.cat([lab, torch.full((N, M, max_p - P), -1, dtype=torch.long)], dim=2)
+            if pad_m > 0:
+                pts = torch.cat([pts, torch.zeros(N, pad_m, max_p, 2)], dim=1)
+                lab = torch.cat([lab, torch.full((N, pad_m, max_p), -1, dtype=torch.long)], dim=1)
+                box = torch.cat([box, torch.zeros(N, pad_m, 4)], dim=1)
+                boxv = torch.cat([boxv, torch.zeros(N, pad_m, dtype=torch.bool)], dim=1)
+            pts_list.append(pts)
+            lab_list.append(lab)
+            box_list.append(box)
+            boxv_list.append(boxv)
+
+    out = {
         "imgs": imgs,
         "prompt_masks": torch.stack(prompt_list),
         "gt_consistent_masks": torch.stack(gt_list),
         "prompt_views": torch.stack(pv_list),
     }
+    if has_multimodal:
+        out["prompt_points"] = torch.stack(pts_list)
+        out["prompt_point_labels"] = torch.stack(lab_list)
+        out["prompt_boxes"] = torch.stack(box_list)
+        out["prompt_box_valid"] = torch.stack(boxv_list)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -341,14 +453,38 @@ def train(args: argparse.Namespace) -> None:
         resolution=args.resolution,
         max_instances=args.max_instances,
         max_prompts=args.max_prompts,
+        prompt_modalities=tuple(args.prompt_modalities),
+        multiview_prompt_prob=args.multiview_prompt_prob,
+        max_prompt_points=args.max_prompt_points,
         seed=args.seed,
     )
+    # Optional puzzle-geometry overrides (verification / ablation).
+    for cli_name, ds_name in [
+        ("min_box_scale", "min_box_size_scale"),
+        ("max_box_scale", "max_box_size_scale"),
+        ("min_overlap",   "min_overlap"),
+        ("max_overlap",   "max_overlap"),
+    ]:
+        v = getattr(args, cli_name)
+        if v is not None:
+            common_ds_kwargs[ds_name] = v
+    if _is_main(rank):
+        logger.info(
+            "Dataset geometry: scale=[%s, %s] overlap=[%s, %s]",
+            common_ds_kwargs.get("min_box_size_scale", "default"),
+            common_ds_kwargs.get("max_box_size_scale", "default"),
+            common_ds_kwargs.get("min_overlap", "default"),
+            common_ds_kwargs.get("max_overlap", "default"),
+        )
 
     train_dataset = SA1BPuzzlesDataset(
         **common_ds_kwargs, augment=not args.no_augment,
     )
+    # Keep validation on the mask-prompt path so val mIoU stays comparable.
+    val_kwargs = {**common_ds_kwargs, "prompt_modalities": ("mask",),
+                  "multiview_prompt_prob": 0.0}
     val_dataset = SA1BPuzzlesDataset(
-        **common_ds_kwargs, augment=False,
+        **val_kwargs, augment=False,
     )
 
     n_val = max(1, int(len(train_dataset) * args.val_split))
@@ -365,6 +501,7 @@ def train(args: argparse.Namespace) -> None:
     train_sampler = DistributedSampler(train_subset, shuffle=True) if is_ddp else None
     val_sampler = DistributedSampler(val_subset, shuffle=False) if is_ddp else None
 
+    _pf = args.prefetch_factor if args.num_workers > 0 else None
     train_loader = DataLoader(
         train_subset,
         batch_size=args.batch_size,
@@ -372,6 +509,8 @@ def train(args: argparse.Namespace) -> None:
         sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
+        prefetch_factor=_pf,
+        persistent_workers=(args.num_workers > 0),
         collate_fn=_pad_collate,
         drop_last=True,
     )
@@ -382,6 +521,8 @@ def train(args: argparse.Namespace) -> None:
         sampler=val_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
+        prefetch_factor=_pf,
+        persistent_workers=(args.num_workers > 0),
         collate_fn=_pad_collate,
     )
 
@@ -390,16 +531,70 @@ def train(args: argparse.Namespace) -> None:
                      n_train, n_val, world_size)
 
     # -- Model --
-    model = build_pi3x_segmentation(
-        checkpoint_path=args.checkpoint,
-        device=str(device),
-        query_dim=args.query_dim,
-        num_decoder_layers=args.num_decoder_layers,
-        nhead=args.nhead,
-    )
+    if args.backbone == "vggt":
+        vggt_layers = tuple(args.vggt_layers) if args.vggt_layers else (17, 23)
+        model = build_vggt_segmentation(
+            checkpoint_path=args.checkpoint,
+            device=str(device),
+            work_dim=args.work_dim,
+            n_obj_tokens=args.n_obj_tokens,
+            n_twoway_layers=args.n_twoway_layers,
+            nhead=args.nhead,
+            use_layers=vggt_layers,
+        )
+    elif args.backbone == "vggt_omega":
+        from models.vggt_omega_segmentation import build_vggt_omega_segmentation
+        vggt_layers = tuple(args.vggt_layers) if args.vggt_layers else (4, 11, 17, 23)
+        pixel_out_dim = args.pixel_out_dim if args.pixel_out_dim is not None else 96
+        backbone_lora_config = None
+        if args.backbone_lora:
+            backbone_lora_config = dict(
+                rank=args.backbone_lora_rank,
+                alpha=args.backbone_lora_alpha,
+                start_layer=args.backbone_lora_start_layer,
+                inter_frame_multiplier=2,
+            )
+        model = build_vggt_omega_segmentation(
+            checkpoint_path=args.checkpoint,
+            device=str(device),
+            work_dim=args.work_dim,
+            n_obj_tokens=args.n_obj_tokens,
+            n_twoway_layers=args.n_twoway_layers,
+            nhead=args.nhead,
+            pixel_out_dim=pixel_out_dim,
+            use_layers=vggt_layers,
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            use_cross_view=args.use_cross_view,
+            use_geom_pe=args.use_geom_pe,
+            backbone_lora_config=backbone_lora_config,
+        )
+    else:
+        from models.pi3x_segmentation import build_pi3x_segmentation
+        model = build_pi3x_segmentation(
+            checkpoint_path=args.checkpoint, device=str(device),
+            query_dim=args.query_dim,
+            num_decoder_layers=args.num_decoder_layers, nhead=args.nhead,
+        )
+
+    if args.compile_backbone and device.type == "cuda":
+        try:
+            model.backbone.aggregator = torch.compile(
+                model.backbone.aggregator, mode=args.compile_mode, dynamic=False,
+            )
+            if _is_main(rank):
+                logger.info("torch.compile enabled on backbone aggregator (mode=%s)",
+                            args.compile_mode)
+        except Exception as e:
+            if _is_main(rank):
+                logger.warning("torch.compile failed: %s — continuing without compile.", e)
 
     if is_ddp:
-        model = DDP(model, device_ids=[device.index], find_unused_parameters=False)
+        model = DDP(
+            model,
+            device_ids=[device.index],
+            find_unused_parameters=args.ddp_find_unused,
+        )
         raw_model = model.module
     else:
         raw_model = model
@@ -416,8 +611,50 @@ def train(args: argparse.Namespace) -> None:
 
     best_iou = 0.0
     global_step = 0
+    start_epoch = 0
 
-    for epoch in range(args.epochs):
+    if args.init_from:
+        init_map = torch.load(args.init_from, map_location=device, weights_only=False)
+        head_attr = "seg_head" if args.backbone == "pi3x" else "head"
+        head_module = getattr(raw_model, head_attr)
+        missing, unexpected = head_module.load_state_dict(
+            init_map["head_state_dict"], strict=False,
+        )
+        loaded_lora = False
+        if ("backbone_lora_state_dict" in init_map and hasattr(raw_model, "backbone")
+                and not args.init_skip_backbone_lora):
+            raw_model.backbone.load_state_dict(
+                init_map["backbone_lora_state_dict"], strict=False,
+            )
+            loaded_lora = True
+        if _is_main(rank):
+            logger.info(
+                "Init-from %s (val_iou=%.4f): head loaded "
+                "(missing=%d, unexpected=%d), backbone_lora=%s; "
+                "optimizer/epoch start fresh.",
+                args.init_from, init_map.get("val_iou", float("nan")),
+                len(missing), len(unexpected), loaded_lora,
+            )
+
+    if args.resume:
+        resume_map = torch.load(args.resume, map_location=device, weights_only=False)
+        head_attr = "seg_head" if args.backbone == "pi3x" else "head"
+        head_module = getattr(raw_model, head_attr)
+        head_module.load_state_dict(resume_map["head_state_dict"])
+        if "backbone_lora_state_dict" in resume_map and hasattr(raw_model, "backbone"):
+            raw_model.backbone.load_state_dict(
+                resume_map["backbone_lora_state_dict"], strict=False,
+            )
+        optimizer.load_state_dict(resume_map["optimizer_state_dict"])
+        scaler.load_state_dict(resume_map["scaler_state_dict"])
+        start_epoch = resume_map["epoch"]
+        best_iou = resume_map.get("val_iou", 0.0)
+        global_step = start_epoch * len(train_loader)
+        if _is_main(rank):
+            logger.info("Resumed from %s  (epoch %d, val_iou=%.4f)",
+                        args.resume, start_epoch, best_iou)
+
+    for epoch in range(start_epoch, args.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
@@ -457,15 +694,35 @@ def train(args: argparse.Namespace) -> None:
             pm = batch["prompt_masks"].to(device)
             gt = batch["gt_consistent_masks"].to(device)
             pv = batch["prompt_views"].to(device)
+            ppts = batch["prompt_points"].to(device) if "prompt_points" in batch else None
+            plab = batch["prompt_point_labels"].to(device) if "prompt_point_labels" in batch else None
+            pbox = batch["prompt_boxes"].to(device) if "prompt_boxes" in batch else None
+            pboxv = batch["prompt_box_valid"].to(device) if "prompt_box_valid" in batch else None
 
+            want_vis = (global_step + 1) % args.vis_freq == 0
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                results = model(imgs, pm)
+                model_kwargs = dict(prompt_views=pv, return_pre_sim=want_vis)
+                if args.backbone == "vggt_omega":
+                    model_kwargs.update(
+                        prompt_points=ppts, prompt_point_labels=plab,
+                        prompt_boxes=pbox, prompt_box_valid=pboxv,
+                    )
+                results = model(imgs, pm, **model_kwargs)
                 logits = results["segmentation_logits"]
+                extras = {k: v for k, v in results.items()
+                          if k in ("iou_pred", "occ_logits", "obj_tokens")}
                 loss = segmentation_loss(
                     logits, gt,
                     prompt_views=pv,
                     lambda_bce=args.lambda_bce,
                     lambda_dice=args.lambda_dice,
+                    extras=extras,
+                    lambda_iou=args.lambda_iou,
+                    lambda_occ=args.lambda_occ,
+                    lambda_consist=args.lambda_consist,
+                    lambda_point=args.lambda_point,
+                    prompt_points=ppts,
+                    prompt_point_labels=plab,
                 )
                 loss = loss / args.accum_steps
 
@@ -489,7 +746,14 @@ def train(args: argparse.Namespace) -> None:
                 writer.add_scalar("train/lr", lr, global_step)
 
                 if global_step % args.vis_freq == 0:
-                    log_vis_to_tb(writer, "train", imgs, pm, gt, logits, global_step)
+                    from utils.vis_utils import log_vis_extended
+                    log_vis_extended(
+                        writer, "train", imgs, pm, gt, logits,
+                        pre_sim=results.get("pre_conditioning_sim"),
+                        obj_tokens=results.get("obj_tokens"),
+                        prompt_views=pv,
+                        global_step=global_step,
+                    )
 
             if _is_main(rank) and (step + 1) % args.print_freq == 0:
                 avg = epoch_loss / n_steps
@@ -521,14 +785,21 @@ def train(args: argparse.Namespace) -> None:
                 gt = batch["gt_consistent_masks"].to(device)
                 pv = batch["prompt_views"].to(device)
 
+                want_val_vis = not vis_logged
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                    results = model(imgs, pm)
+                    results = model(imgs, pm, prompt_views=pv, return_pre_sim=want_val_vis)
                     logits = results["segmentation_logits"]
+                    extras = {k: v for k, v in results.items()
+                              if k in ("iou_pred", "occ_logits", "obj_tokens")}
                     loss = segmentation_loss(
                         logits, gt,
                         prompt_views=pv,
                         lambda_bce=args.lambda_bce,
                         lambda_dice=args.lambda_dice,
+                        extras=extras,
+                        lambda_iou=args.lambda_iou,
+                        lambda_occ=args.lambda_occ,
+                        lambda_consist=args.lambda_consist,
                     )
 
                 val_loss_sum += loss.item()
@@ -536,7 +807,14 @@ def train(args: argparse.Namespace) -> None:
                 val_steps += 1
 
                 if _is_main(rank) and writer is not None and not vis_logged:
-                    log_vis_to_tb(writer, "val", imgs, pm, gt, logits, epoch + 1)
+                    from utils.vis_utils import log_vis_extended
+                    log_vis_extended(
+                        writer, "val", imgs, pm, gt, logits,
+                        pre_sim=results.get("pre_conditioning_sim"),
+                        obj_tokens=results.get("obj_tokens"),
+                        prompt_views=pv,
+                        global_step=epoch + 1,
+                    )
                     vis_logged = True
 
         avg_val_loss = val_loss_sum / max(val_steps, 1)
@@ -556,23 +834,37 @@ def train(args: argparse.Namespace) -> None:
 
         # -- Checkpointing (rank 0 only) --
         if _is_main(rank):
+            head_attr = "seg_head" if args.backbone == "pi3x" else "head"
+            head_module = getattr(raw_model, head_attr)
+            backbone_lora_sd = None
+            if getattr(raw_model, "backbone", None) is not None and \
+                    getattr(raw_model.backbone, "_lora_enabled", False):
+                from models.lora_utils import lora_state_dict
+                backbone_lora_sd = lora_state_dict(raw_model.backbone)
+
             if (epoch + 1) % args.save_freq == 0:
                 ckpt = {
                     "epoch": epoch + 1,
-                    "seg_head_state_dict": raw_model.seg_head.state_dict(),
+                    "backbone_type": args.backbone,
+                    "head_state_dict": head_module.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scaler_state_dict": scaler.state_dict(),
                     "val_iou": avg_val_iou,
                 }
+                if backbone_lora_sd is not None:
+                    ckpt["backbone_lora_state_dict"] = backbone_lora_sd
                 torch.save(ckpt, out_dir / "checkpoint-last.pth")
 
             if avg_val_iou > best_iou:
                 best_iou = avg_val_iou
-                torch.save(
-                    {"seg_head_state_dict": raw_model.seg_head.state_dict(),
-                     "val_iou": best_iou},
-                    out_dir / "checkpoint-best.pth",
-                )
+                best_ckpt = {
+                    "backbone_type": args.backbone,
+                    "head_state_dict": head_module.state_dict(),
+                    "val_iou": best_iou,
+                }
+                if backbone_lora_sd is not None:
+                    best_ckpt["backbone_lora_state_dict"] = backbone_lora_sd
+                torch.save(best_ckpt, out_dir / "checkpoint-best.pth")
                 logger.info("New best mIoU: %.4f — saved checkpoint-best.pth", best_iou)
 
         if is_ddp:
