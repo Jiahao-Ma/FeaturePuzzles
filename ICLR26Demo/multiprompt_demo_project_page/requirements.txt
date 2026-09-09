@@ -1,0 +1,5 @@
+# Extra dependencies on top of the `lingbot-map` environment, which already
+# provides torch, opencv, numpy, scipy, open3d, viser and segment_anything.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9

@@ -20,13 +20,20 @@ Everything here is frozen (no grad) — it only defines the target, never trains
 """
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-TALK2DINO_REPO = "/mnt/dataset/marko/puzzles/puzzles/repo/Talk2DINO"
+# Resolve the Talk2DINO repo relative to this file (release root / repo / Talk2DINO),
+# overridable via the TALK2DINO_REPO env var for portability.
+TALK2DINO_REPO = os.environ.get(
+    "TALK2DINO_REPO",
+    str(Path(__file__).resolve().parents[2] / "repo" / "Talk2DINO"),
+)
 
 # ImageNet-style template ensemble for robust text embeddings.
 _TEMPLATES = [

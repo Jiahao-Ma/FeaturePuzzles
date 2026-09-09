@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VGGT-Omega &middot; Promptable Segmentation</title>
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo"></span>
+    <div>
+      <h1>Promptable Spatial Segmentation</h1>
+      <p>VGGT-Omega multiprompt &middot; static &amp; dynamic scenes</p>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <span class="pill" id="pill-geometry">geometry &mdash;</span>
+    <span class="pill" id="pill-frames">frames &mdash;</span>
+    <span class="pill pill-state" id="pill-state">idle</span>
+  </div>
+</header>
+
+<main class="layout">
+
+  <!-- ── left rail ─────────────────────────────────────────────── -->
+  <aside class="rail">
+
+    <section class="step" data-step="1">
+      <div class="step-head"><span class="num">1</span><h2>Input</h2></div>
+      <div class="step-body">
+        <div class="seg-control" id="source-tabs">
+          <button class="active" data-tab="gallery">Gallery</button>
+          <button data-tab="upload">Upload</button>
+        </div>
+
+        <div id="tab-gallery">
+          <input class="search" id="gallery-search" type="search" placeholder="Filter clips&hellip;">
+          <div class="gallery" id="gallery"></div>
+        </div>
+
+        <div id="tab-upload" hidden>
+          <label class="dropzone" id="dropzone">
+            <input type="file" id="file-input" accept="video/*,image/*" multiple hidden>
+            <strong>Drop a video here</strong>
+            <span>or several images for a multi-view set &middot; mp4, mov, webm, jpg, png</span>
+          </label>
+        </div>
+
+        <div class="field">
+          <label for="n-frames">Frames sampled <b id="n-frames-val">24</b></label>
+          <input type="range" id="n-frames" min="6" max="96" step="2" value="24">
+          <span class="hint">More frames densify the point cloud. Dynamic mode
+            feeds them all to one forward pass, so cost grows quickly there.</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="step" data-step="2">
+      <div class="step-head"><span class="num">2</span><h2>Scene type</h2></div>
+      <div class="step-body">
+        <div class="choice" id="scene-mode">
+          <label class="choice-card selected">
+            <input type="radio" name="scene" value="dynamic" checked>
+            <b>Dynamic</b>
+            <span>Moving subject. One pass over the whole clip; geometric
+              filtering is disabled because a moving object occupies different
+              world coordinates every frame.</span>
+          </label>
+          <label class="choice-card">
+            <input type="radio" name="scene" value="static">
+            <b>Static</b>
+            <span>Rigid scene. Six-frame clip tracking with cross-object
+              exclusivity, then a 3D-connectivity filter that removes mask
+              growth not physically connected to the seed.</span>
+          </label>
+        </div>
+      </div>
+    </section>
+
+    <section class="step" data-step="3">
+      <div class="step-head"><span class="num">3</span><h2>Prompt</h2></div>
+      <div class="step-body">
+        <div class="seg-control" id="prompt-tabs">
+          <button class="active" data-tab="points">Click points</button>
+          <button data-tab="dense">Segment everything</button>
+        </div>
+
+        <div id="tab-points">
+          <div class="hint">Click the subject on the reference frame. Shift-click
+            (or pick <em>Exclude</em>) to carve away a region.</div>
+          <div class="seg-control small" id="point-polarity">
+            <button class="active" data-label="1">Include</button>
+            <button data-label="0">Exclude</button>
+          </div>
+          <div class="objects" id="objects"></div>
+          <button class="ghost wide" id="add-object">+ Add object</button>
+        </div>
+
+        <div id="tab-dense" hidden>
+          <div class="hint">Runs SAM's dense point grid on the reference frame
+            and keeps the largest regions as multi-mask prompts.</div>
+          <div class="field">
+            <label for="grid-density">Grid density <b id="grid-density-val">32</b>&times;<b>32</b></label>
+            <input type="range" id="grid-density" min="8" max="48" step="4" value="32">
+          </div>
+          <div class="field">
+            <label for="top-k">Objects kept <b id="top-k-val">6</b></label>
+            <input type="range" id="top-k" min="1" max="16" step="1" value="6">
+          </div>
+        </div>
+
+        <button class="primary wide" id="preview-btn" disabled>Preview masks</button>
+      </div>
+    </section>
+
+    <section class="step" data-step="4">
+      <div class="step-head"><span class="num">4</span><h2>Run</h2></div>
+      <div class="step-body">
+        <label class="switch"><input type="checkbox" id="opt-render" checked>
+          <span>Render 3D videos</span></label>
+        <label class="switch"><input type="checkbox" id="opt-exclusive" checked>
+          <span>Cross-object exclusivity</span></label>
+        <label class="switch" id="opt-geocc-wrap"><input type="checkbox" id="opt-geocc" checked>
+          <span>3D-connectivity filter <em>(static only)</em></span></label>
+        <button class="primary wide big" id="run-btn" disabled>Segment all frames</button>
+      </div>
+    </section>
+
+  </aside>
+
+  <!-- ── stage ─────────────────────────────────────────────────── -->
+  <section class="stage">
+
+    <div class="stage-card">
+      <div class="stage-head">
+        <h3>Reference frame</h3>
+        <div class="stage-tools">
+          <button class="ghost" id="undo-point">Undo point</button>
+          <button class="ghost" id="clear-points">Clear</button>
+          <button class="ghost" id="toggle-preview" hidden>Hide masks</button>
+        </div>
+      </div>
+      <div class="canvas-wrap" id="canvas-wrap">
+        <div class="placeholder" id="canvas-placeholder">
+          <p>Pick a clip to begin</p>
+        </div>
+        <img id="frame-img" alt="reference frame" hidden>
+        <img id="mask-img" class="mask-layer" alt="mask preview" hidden>
+        <canvas id="point-canvas" hidden></canvas>
+      </div>
+      <div class="filmstrip" id="filmstrip"></div>
+    </div>
+
+    <div class="stage-card results" id="results-card" hidden>
+      <div class="stage-head">
+        <h3>Result</h3>
+        <div class="seg-control small" id="result-tabs">
+          <button class="active" data-tab="pip">3D + insets</button>
+          <button data-tab="overlay">Mask overlay</button>
+          <button data-tab="viser">Interactive 3D</button>
+        </div>
+      </div>
+      <div class="result-body">
+        <div id="res-pip"><video id="pip-video" controls loop playsinline></video></div>
+        <div id="res-overlay" hidden><video id="overlay-video" controls loop playsinline></video></div>
+        <div id="res-viser" hidden>
+          <div class="viser-bar">
+            <button class="ghost" id="viser-start">Launch viewer</button>
+            <span class="hint inline" id="viser-hint">Per-frame playback with the
+              follow camera, point size and colour controls.</span>
+          </div>
+          <iframe id="viser-frame" title="viser point cloud viewer" hidden></iframe>
+        </div>
+      </div>
+      <div class="meta" id="result-meta"></div>
+    </div>
+
+    <div class="stage-card console" id="console-card">
+      <div class="stage-head">
+        <h3>Log</h3>
+        <span class="progress" id="progress-line"></span>
+      </div>
+      <pre id="log"></pre>
+    </div>
+
+  </section>
+</main>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>

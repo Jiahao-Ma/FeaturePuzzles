@@ -1,0 +1,16 @@
+DINOv3 teacher score (min-max normalised cosine sim):
+  min=0.0009 max=0.9987 mean=0.2522 p50=0.1948 p90=0.5344 p95=0.8260
+  frac > 0.20: 0.4741
+  frac > 0.25: 0.2471
+  frac > 0.30: 0.1195
+  frac > 0.35: 0.1136
+  frac > 0.40: 0.1105
+
+feat_dinov3 (VGGT-Omega) score (min-max normalised cosine sim):
+  min=0.0000 max=0.9997 mean=0.3964 p50=0.3787 p90=0.5416 p95=0.7731
+  frac > 0.20: 0.9763
+  frac > 0.25: 0.8924
+  frac > 0.30: 0.7190
+  frac > 0.35: 0.5683
+  frac > 0.40: 0.4239
+

@@ -1,0 +1,18 @@
+# Core
+torch>=2.3.0
+torchvision>=0.18.0
+numpy>=1.26.4
+pillow
+opencv-python
+scipy
+einops
+safetensors
+matplotlib
+huggingface-hub[torch]
+
+# DINOv3 + Talk2DINO teacher (feat_dinov3 / feat_dinov3_lingbot)
+timm
+open_clip_torch
+
+# Optional: tensorboard for training
+tensorboard
