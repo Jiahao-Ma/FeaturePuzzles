@@ -1,0 +1,152 @@
+# Default configuration for the Feature Puzzles data-material pipeline.
+# Every stage reads from this file; CLI flags override these values.
+
+seed: 42
+device: cuda
+
+# Stage 1: parent object masks -----------------------------------------------
+# Interchangeable mask backends; pick with `masks.backend`.
+#   sam2         : SAM2.1 (hiera-large) "segment everything" with stability-score
+#                  filtering — Meta's latest, object-level segments (recommended).
+#   grounded_sam2: Grounding DINO (open-vocab detection) -> SAM2 (box-prompt seg)
+#                  + coverage passes. Object-aware: detection proposes objects,
+#                  SAM2 refines to masks. Best for cluttered/thin structures.
+#   grounded_sam : Grounding DINO + SAM1 (object-based, text-prompted).
+#   sam          : SAM ViT-H "segment everything" (point grid + NMS).
+#   fastsam      : FastSAM (fast, generic segments).
+masks:
+  backend: sam2                    # grounded_sam2 | sam2 | grounded_sam | sam | fastsam
+  fastsam:
+    weights: /mnt/dataset/marko/puzzles/puzzles/ESAMBench/weights/FastSAM-x.pt
+    imgsz: 1024
+    conf: 0.4
+    iou: 0.9
+    retina_masks: true
+    min_area: 200                # px; drop tiny fragments
+    max_props: 60                # cap number of instances kept
+  grounded_sam:
+    grounding_dir: weights/grounding-dino-tiny   # local HF snapshot
+    sam_dir: weights/sam-vit-huge               # local HF snapshot
+    box_threshold: 0.25
+    text_threshold: 0.25
+    text_prompt: "objects. furniture. sofa. chair. table. lamp. window. rug. wall. ceiling. floor. tv. bed. plant. painting. door. shelf"
+    min_area: 200
+    max_props: 60
+  grounded_sam2:
+    grounding_dir: weights/grounding-dino-tiny   # local HF snapshot (Grounding DINO)
+    box_threshold: 0.22            # detection confidence (lower = more boxes, incl. small items)
+    text_threshold: 0.20          # phrase-region match threshold
+    box_batch: 32                 # boxes per SAM2 decoder forward
+    # rich prompt: includes small/cluttered items (books, vases, frames) and
+    # thin structures (chandelier) that pure SAM2 automatic mode misses.
+    text_prompt: "objects. furniture. sofa. couch. chair. armchair. table. coffee table. lamp. chandelier. light. window. curtain. rug. carpet. wall. ceiling. floor. tv. bed. pillow. cushion. plant. vase. pot. painting. picture. frame. door. shelf. bookshelf. book. books. bowl. sculpture. clock. mirror. stairs. railing"
+  sam:
+    sam_dir: weights/sam-vit-huge               # local HF snapshot (SAM ViT-H)
+    point_step: 32               # grid spacing for foreground points (px)
+    point_batch: 32               # points per mask-decoder forward
+    score_threshold: 0.88        # keep masks with IoU score above this
+    nms_iou: 0.7                 # dedup IoU threshold
+    min_area: 200                 # px; drop tiny fragments
+    max_props: 60                # cap number of instances kept
+  sam2:
+    sam2_dir: weights/sam2.1-hiera-large        # local HF snapshot (SAM2.1 hiera-large)
+    point_step: 32               # foreground point grid spacing (px) — finer = catches small items
+    point_batch: 32              # points (each its own object) per decoder forward
+    pred_iou_thresh: 0.80        # keep masks with predicted IoU above this (lower = keeps thin/low-contrast)
+    stability_score_thresh: 0.85  # keep masks with SAM stability score above this (lower = keeps thin structures)
+    stability_offset: 1.0        # +/- offset (logits) for the stability score
+    nms_iou: 0.7                # dedup IoU threshold
+    containment_thr: 0.92         # fragments >this contained in a similar-size mask are merged away
+    containment_max_ratio: 3.0    # only merge into a mask <=this x the candidate's area (preserves small items on big backgrounds)
+    hole_fill: true                # 2nd pass: segment unmasked regions the grid missed
+    hole_fill_iters: 3           # iterations of the hole-fill pass (re-prompt in remaining holes)
+    hole_new_frac: 0.4           # a hole-fill mask is kept if >this fraction of it is new coverage
+    hole_fill_max: 40             # max number of hole-fill masks added on top of the base masks
+    cover_all: true                # 3rd pass: give every remaining region a mask (full coverage)
+    drop_thin_fragments: true       # 4th pass: drop thin sliver masks (low extent), absorb into neighbours
+    thin_extent_thresh: 0.25        # area/bbox ratio below which a mask counts as a thin fragment
+    drop_texture_artifacts: false   # OFF (reverted): drop big low-solidity texture masks; previous-version segmentation kept
+    artifact_solidity_thresh: 0.6   # area/convex-hull ratio below which a large mask is a texture artifact (e.g. ribbed sofa)
+    artifact_min_area: 30000        # only drop texture artifacts with area >= this (px); spares smaller thin real objects like a chandelier
+    drop_border_masks: false       # 5th pass (off): drop masks touching the image border (background slabs)
+    border_margin: 2             # px margin from the edge that counts as "touching the border"
+    residual_min_area: 200         # min area (px) for a residual connected-component mask
+    residual_max: 40             # max number of residual masks; largest kept
+    residual_dilate_px: 3         # absorb thin gaps (<this dilation) into neighbouring masks
+    min_area: 400                 # px; drop tiny fragments but keep small items (books/frames)
+    max_props: 120                # cap number of base (first-pass) instances kept (higher = keeps small items)
+
+# Stage 2: MoGe-2 monocular geometry ------------------------------------------
+moge:
+  model: Ruicheng/moge-2-vitl-normal   # HuggingFace hub id
+  resolution_level: 9                   # 0-9, higher = finer
+  num_tokens: null                      # null -> use resolution_level
+  fp16: true
+  threshold: 0.01                       # depth-edge threshold for valid mask
+  depth_edge_rtol: 0.01                  # remove depth discontinuity edges (utils3d depth_edge)
+
+# Stage 3: Puzzles crop sequence + cameras ------------------------------------
+# `sampling`:
+#   coverage   : place N crops on a grid (matched to the image aspect ratio) with
+#                 jittered centres and slightly randomized sizes so they cover
+#                 ~`coverage_target` of the image (NOT the whole image) — emphasises
+#                 view span with some randomness, per the "cover 90%+" requirement.
+#   trajectory : ordered overlapping crops (consecutive IoU in range), the
+#                 official Image2Clips lamp.jpg behaviour.
+puzzles:
+  n_crops: 6
+  sampling: coverage                      # coverage | trajectory
+  overlap_pad: 0.1                        # seam overlap fraction (coverage mode)
+  coverage_target: 0.9                    # target image coverage (coverage mode)
+  coverage_jitter: 0.15                   # centre jitter as a fraction of the cell (coverage mode)
+  min_box_size_scale: 0.2               # fraction of shorter parent side
+  max_box_size_scale: 0.5
+  min_overlap: 0.1                        # consecutive IoU range (trajectory mode)
+  max_overlap: 0.3
+  template_long: 256                     # template crop side (px)
+  calib_num_pts: 1024                   # correspondences per crop for PnP
+  pnp:
+    min_inliers: 50
+    max_reproj_err_px: 5.0
+  max_resample_tries: 60                # per-crop resample budget
+  augmentation:
+    enabled: true                       # produce the comparison branch
+    rotate_ratio: 0.2
+    max_rotation_angle: 60.0
+    rotate_min_coverage: 0.2
+    rotate_max_coverage: 0.8
+    front_back_ratio_thresh: 0.6
+
+# Stage 4B: DINOv3 teacher features -------------------------------------------
+# `mode` selects the high-resolution feature backend:
+#   dinov3        : DINOv3-B/16 on a high-res aspect-preserved parent (native
+#                  dense patch tokens, the DINOv3 paper's high-res recipe, Fig 4).
+#                  Higher `teacher_long` = finer features. Tokens are then warped
+#                  into each crop (parent-first, cross-view consistent).
+#   dinov3_jafar  : DINOv3-B/16 low-res patch tokens -> JAFAR RGB-guided upsampler
+#                  -> high-res dense features (DINOv3 + JAFAR combination)
+dinov3:
+  variant: vit_base_patch16_dinov3.lvd1689m
+  mode: dinov3                          # dinov3 | dinov3_jafar
+  teacher_long: 4096                    # parent long side fed to DINOv3 (dinov3 mode)
+  clip_long_side: 384                    # DINOv3 input long side (dinov3_jafar mode)
+  feature_long_side: 192               # JAFAR target feature long side (dinov3_jafar mode)
+  feature_res: 128                       # warped crop feature side
+  pca_components: 3
+  pca_samples: 200000                    # pixels sampled to fit PCA
+  pca_color: rgb                          # rgb | cmap | hsv | best (PCA->colour scheme; `rgb` = original direct comp->R/G/B)
+  pca_cmap: Spectral                      # matplotlib colormap for the `cmap` scheme (MoGe depth uses Spectral)
+  pca_hue_offset: 0.0                    # hue rotation [0,1) for the hsv scheme
+  pca_pct: 2.0                           # percentile clip for the normalization bounds
+  # Local checkpoints (avoid HF hub round-trips).
+  # DINOv3 backbone weights come from the timm HF cache (pretrained=True).
+  # jafar_ckpt is the JAFAR upsampler trained with the DINOv3 backbone.
+  jafar_ckpt: /mnt/dataset/marko/puzzles/puzzles/checkpoints/jafar/vit_base_patch16_dinov3.lvd1689m.pth
+  jafar_repo: /mnt/dataset/marko/puzzles/puzzles/repo/JAFAR
+
+# Stage 5: visualization ------------------------------------------------------
+visualization:
+  png_dpi: 200
+  pointcloud_step: 4                     # subsample stride for 3D renders
+  frustum_scale: 0.35                    # frustum size relative to scene
+  montage_thumbnail_max: 512
